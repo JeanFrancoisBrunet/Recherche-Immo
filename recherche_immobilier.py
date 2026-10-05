@@ -10,7 +10,7 @@ Aucun accès au site SeLoger : le script ne lit que VOTRE boîte Gmail (IMAP), o
 ils sont seulement conservés dans le CSV, un clic de votre part ouvre l'annonce.
 
 La récurrence est assurée par cron, PAS par ce script : crontab -e
-   # pour une mise à jour 2 fois/jour, matin et soir
+   # pour une mise à jour 2 fois par jour, matin et soir
    0 7,19 * * * cd /home/jfbrunet/Projects/Groq_agent/Recherche_immo && python3 recherche_immobilier.py >> journal.log 2>&1
 
 Mise en place (une seule fois)
@@ -28,11 +28,11 @@ Mise en place (une seule fois)
    (variable GMAIL_APP_PW, lue dans l'environnement ou dans le fichier .secrets.env indiqué dans la configuration).
 4. Premier lancement : le script crée recherche_immobilier.yaml (modèle) puis s'arrête. Éditez-le (avec vos critères), puis relancez.
 5. Notification Telegram (facultatif) : réutilise le même bot et le même fichier que emails_scan.py
-   (~/.telegram_config, section [telegram], clés token_groq et chat_id) — rien à reconfigurer si emails_scan.py l'utilise déjà. 
-   Un message est envoyé après chaque exécution réelle (pas --a-blanc)
+   (~/.telegram_config, section [telegram], clés token_groq et chat_id) — rien à reconfigurer si
+   emails_scan.py l'utilise déjà. Un message est envoyé après chaque exécution réelle (pas --a-blanc)
    où au moins une nouveauté ou un changement de prix a été trouvé (voir 'telegram.notifier_si_rien'
-   dans la configuration pour être notifié même quand il n'y a rien de nouveau). Si le fichier ou la section [telegram] est absent, 
-   la notification est simplement ignorée (avertissement sur stderr).
+   dans la configuration pour être notifié même quand il n'y a rien de nouveau). Si le fichier ou la
+   section [telegram] est absent, la notification est simplement ignorée (avertissement sur stderr).
 
 Outils de mise au point :
     python3 recherche_immobilier.py --eml alerte.eml    # teste l'extraction sur un e-mail enregistré (.eml/.html), sans Gmail ni écriture
@@ -44,7 +44,8 @@ Outils de mise au point :
 À Savoir :
 - Le statut lu/non lu des e-mails n'a AUCUNE importance : le script lit tous les messages du libellé dans la fenêtre 'jours_max', qu'ils soient lus ou non, et ne les marque jamais comme lus (BODY.PEEK).
 - Si des alertes reçues dans le libellé ne ressortent pas, lancez --diagnostic :
-  il montre CHAQUE message lu (annonce trouvée ou non) ainsi que ceux écartés faute d'expéditeur reconnu. Un message compté « analysé(e) » mais à 0 annonce n'est pas forcément une anomalie : SeLoger envoie aussi des e-mails de promotion de son application, sans annonce exploitable.
+  il montre CHAQUE message lu (annonce trouvée ou non) ainsi que ceux écartés faute d'expéditeur reconnu. Un message compté « analysé(e) » mais à 0 annonce n'est pas forcément une anomalie : 
+  SeLoger envoie aussi des e-mails de promotion de son application, sans annonce exploitable.
 - Lancez le script deux fois de suite (--a-blanc) : la 2e fois doit annoncer 0 nouveauté (aucun message ne doit être retraité).
 - Lancez-le une fois avec un environnement proche de celui de cron, qui ne reprend pas votre session interactive :
       env -i HOME="$HOME" python3 recherche_immobilier.py --a-blanc
@@ -58,6 +59,7 @@ Limites à connaitre :
   le lien de suivi est propre à chaque e-mail et ne peut pas servir d'identifiant. Deux biens rigoureusement identiques dans le même quartier seraient confondus.
 - La mise en page réelle des alertes n'a été vue que sur des e-mails de confirmation : au premier vrai relevé, vérifiez le CSV et utilisez --diagnostic si une alerte ne donne aucune annonce.
 - Un e-mail de confirmation (envoyé à la création d'une recherche) est toujours compté à part (« confirmation(s) ignorée(s) »), mais ses éventuelles « annonces similaires » sont lues comme celles de n'importe quel e-mail, selon 'inclure_similaires' (voir ce réglage dans la configuration) : c'est le moyen de récupérer un premier aperçu après avoir recréé une recherche.
+- La transaction (achat/location) est déduite, dans l'ordre : du texte de l'annonce (louer/vendre, suffixe /mois, prix au m²), du sujet de l'e-mail, du bandeau « Votre recherche » s'il existe, puis, en dernier recours, du montant du prix (SEUIL_PRIX_ACHAT, 3000 € par défaut : en dessous, loyer ; au-dessus, vente). Ce dernier recours couvre les annonces de maison à vendre, qui n'affichent ni /mois ni prix au m². À ajuster si vous visez une autre zone géographique où cet écart de prix loyer/vente serait moins net.
 
 Fichiers :
     recherche_immobilier.yaml               configuration et critères
@@ -329,6 +331,14 @@ PRICE_RE = re.compile(
 # transaction même quand l'e-mail ne contient ni « louer/vendre » ni bandeau
 # « Votre recherche » (cas des alertes « 1 nouvelle annonce... » à bien unique).
 PRICE_PER_M2_RE = re.compile(r"€\s*/\s*m[²2]", re.I)
+# Dernier recours : une maison à vendre n'affiche ni suffixe « /mois » ni prix
+# au m² dans l'alerte (contrairement aux appartements), et peut aussi manquer
+# de bandeau « Votre recherche » et de mot « louer/vendre » dans le sujet. Le
+# montant seul reste alors un indice fiable : à L'Aigle, un loyer ne dépasse
+# jamais quelques centaines d'euros, un bien à vendre commence à plusieurs
+# dizaines de milliers — l'écart est assez large pour ne jamais se tromper
+# dans la pratique. N'est utilisé que si aucun autre indice n'a été trouvé.
+SEUIL_PRIX_ACHAT = 3000
 TYPE_RE = re.compile(
     r"^(appartement|maison|studio|loft|duplex|triplex|villa|terrain|parking|"
     r"immeuble|local|bureau|commerce|chateau|propriete|peniche)\b", re.I)
@@ -449,7 +459,10 @@ def extract_cards(tokens, include_similar: bool) -> list[dict]:
 def card_to_record(card: dict, subject: str, context: dict | None = None) -> dict:
     context = context or {}
     transaction = (card["transaction"] or subject_transaction(subject)
-                  or context.get("transaction") or "inconnue")
+                  or context.get("transaction") or "")
+    if not transaction and card["prix"] is not None:
+        transaction = "achat" if card["prix"] >= SEUIL_PRIX_ACHAT else "location"
+    transaction = transaction or "inconnue"
     record = {
         "transaction": transaction,
         "type": card["type"] or context.get("type") or "bien",
