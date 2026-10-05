@@ -52,6 +52,7 @@ Limites à connaitre :
 - L'identité d'une annonce est une empreinte (transaction, type, pièces, surface, code postal, quartier, ville) : 
   le lien de suivi est propre à chaque e-mail et ne peut pas servir d'identifiant. Deux biens rigoureusement identiques dans le même quartier seraient confondus.
 - La mise en page réelle des alertes n'a été vue que sur des e-mails de confirmation : au premier vrai relevé, vérifiez le CSV et utilisez --diagnostic si une alerte ne donne aucune annonce.
+- Un e-mail de confirmation (envoyé à la création d'une recherche) est toujours compté à part (« confirmation(s) ignorée(s) »), mais ses éventuelles « annonces similaires » sont lues comme celles de n'importe quel e-mail, selon 'inclure_similaires' (voir ce réglage dans la configuration) : c'est le moyen de récupérer un premier aperçu après avoir recréé une recherche.
 
 Fichiers :
     recherche_immobilier.yaml               configuration et critères
@@ -60,7 +61,7 @@ Fichiers :
                                             (=LIEN.HYPERTEXTE(...), nom français de HYPERLINK)
     recherche_immobilier_annonces.html      TOUTES les annonces connues, avec de vrais liens cliquables (balises <a>) 
                                             réécrit à chaque exécution (pas un journal) ; à ouvrir dans un navigateur, sans dépendre des réglages d'import CSV d'un tableur
-    recherche_immobilier_etat.json          e-mails déjà traités
+    recherche_immobilier_etat.json          e-mails déjà traités (à vider si nécessaire pour relancer le processus)
 
 Dépendances : pyyaml (déjà installé pour emails_scan.py)
     pip install pyyaml --break-system-packages
@@ -122,27 +123,35 @@ expediteurs:
 
 jours_max: 90                 # fenêtre de lecture des e-mails (jours)
 inclure_similaires: false     # false : ignore les « annonces similaires »
-                              # (hors de votre recherche) ajoutées par SeLoger
+                              # (hors de votre recherche) ajoutées par SeLoger,
+                              # y compris celles glissées dans un e-mail de
+                              # confirmation de création d'alerte. Passez-le à
+                              # true temporairement après avoir créé ou recréé
+                              # une recherche, pour récupérer en une fois les
+                              # quelques annonces déjà en ligne qu'elle
+                              # contient — remettez à false ensuite, sinon ces
+                              # suggestions hors critères stricts continueront
+                              # à être journalisées à chaque confirmation.
 
 # Critères appliqués aux annonces lues, par transaction. Tous facultatifs.
 # Une valeur absente sur l'annonce (ex. pièces non indiquées) n'exclut pas l'annonce. 
 # Loyer mensuel pour « location », prix pour « achat ».
 criteres:
   location:
-    pieces_min: 1
+    # pieces_min: 1
     pieces_max: 3
-    surface_min: 15
-    surface_max: 40
+    # surface_min: 15
+    # surface_max: 40
     # budget_min: 0
-    # budget_max: 500
+    budget_max: 600
     codes_postaux: ["61300"]
   achat:
-    pieces_min: 1
+    # pieces_min: 1
     pieces_max: 3
-    surface_min: 15
-    surface_max: 40
+    # surface_min: 15
+    # surface_max: 40
     # budget_min: 0
-    # budget_max: 80000
+    budget_max: 200000
     codes_postaux: ["61300"]
 """
 
@@ -719,20 +728,26 @@ def main() -> int:
                 print(f"[SKIP] expéditeur non reconnu ({sender!r}) : {subject!r}")
             continue
         tokens = message_tokens(msg)
-        if is_confirmation(tokens, subject):
+        confirmation = is_confirmation(tokens, subject)
+        if confirmation:
             ignored += 1
-            new_ids.append(msg_id)
-            if args.diagnostic:
-                print(f"[CONFIRMATION] {sender!r} : {subject!r}")
-            continue
-        analysed += 1
+        else:
+            analysed += 1
+        # Une confirmation de création d'alerte contient souvent un petit
+        # échantillon « Annonces similaires pour vous » : on l'extrait quand
+        # même (comme un e-mail normal), ce qui donne un premier aperçu dès
+        # la création ou la recréation d'une recherche. Activez
+        # 'inclure_similaires: true' dans la configuration pour le recevoir ;
+        # sinon ces annonces hors critères stricts sont ignorées comme
+        # d'habitude.
         context = search_context(tokens)
         cards = extract_cards(tokens, include_similar)
         if args.diagnostic:
             extra = (f" — bandeau : {context['type']}/{context['transaction'] or '?'}"
                      if context else "")
-            print(f"[ALERTE] {sender!r} : {subject!r} — {len(cards)} annonce(s){extra}")
-        if not cards:
+            tag = "[CONFIRMATION]" if confirmation else "[ALERTE]"
+            print(f"{tag} {sender!r} : {subject!r} — {len(cards)} annonce(s){extra}")
+        if not cards and not confirmation:
             print(f"[WARN] aucune annonce trouvée dans : {subject!r} "
                   "(mise en page inattendue ? lancez --diagnostic ou --eml)")
         if args.diagnostic:

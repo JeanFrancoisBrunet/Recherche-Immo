@@ -10,7 +10,7 @@ Aucun accès au site SeLoger : le script ne lit que VOTRE boîte Gmail (IMAP), o
 ils sont seulement conservés dans le CSV, un clic de votre part ouvre l'annonce.
 
 La récurrence est assurée par cron, PAS par ce script : crontab -e
-   # pour une mise à jour 2 fois par jour, matin et soir
+   # pour une mise à jour 2 fois/jour, matin et soir
    0 7,19 * * * cd /home/jfbrunet/Projects/Groq_agent/Recherche_immo && python3 recherche_immobilier.py >> journal.log 2>&1
 
 Mise en place (une seule fois)
@@ -24,9 +24,15 @@ Mise en place (une seule fois)
    et déplace tout vers Outlook. Avec ce filtre, les alertes SeLoger n'y arrivent jamais : 
    emails_scan.py ne les voit pas, et ce script les lit dans le libellé « Immo ». 
    Aucune modification d'emails_scan.py n'est requise.
-3. Ce script réutilise le mot de passe d'application Gmail déjà stocké pour emails_scan.py 
+3. Ce script réutilise le mot de passe d'application Gmail déjà stocké pour emails_scan.py
    (variable GMAIL_APP_PW, lue dans l'environnement ou dans le fichier .secrets.env indiqué dans la configuration).
 4. Premier lancement : le script crée recherche_immobilier.yaml (modèle) puis s'arrête. Éditez-le (avec vos critères), puis relancez.
+5. Notification Telegram (facultatif) : réutilise le même bot et le même fichier que emails_scan.py
+   (~/.telegram_config, section [telegram], clés token_groq et chat_id) — rien à reconfigurer si emails_scan.py l'utilise déjà. 
+   Un message est envoyé après chaque exécution réelle (pas --a-blanc)
+   où au moins une nouveauté ou un changement de prix a été trouvé (voir 'telegram.notifier_si_rien'
+   dans la configuration pour être notifié même quand il n'y a rien de nouveau). Si le fichier ou la section [telegram] est absent, 
+   la notification est simplement ignorée (avertissement sur stderr).
 
 Outils de mise au point :
     python3 recherche_immobilier.py --eml alerte.eml    # teste l'extraction sur un e-mail enregistré (.eml/.html), sans Gmail ni écriture
@@ -38,8 +44,7 @@ Outils de mise au point :
 À Savoir :
 - Le statut lu/non lu des e-mails n'a AUCUNE importance : le script lit tous les messages du libellé dans la fenêtre 'jours_max', qu'ils soient lus ou non, et ne les marque jamais comme lus (BODY.PEEK).
 - Si des alertes reçues dans le libellé ne ressortent pas, lancez --diagnostic :
-  il montre CHAQUE message lu (annonce trouvée ou non) ainsi que ceux écartés faute d'expéditeur reconnu. Un message compté « analysé(e) » mais à 0 annonce n'est pas forcément une anomalie : 
-  SeLoger envoie aussi des e-mails de promotion de son application, sans annonce exploitable.
+  il montre CHAQUE message lu (annonce trouvée ou non) ainsi que ceux écartés faute d'expéditeur reconnu. Un message compté « analysé(e) » mais à 0 annonce n'est pas forcément une anomalie : SeLoger envoie aussi des e-mails de promotion de son application, sans annonce exploitable.
 - Lancez le script deux fois de suite (--a-blanc) : la 2e fois doit annoncer 0 nouveauté (aucun message ne doit être retraité).
 - Lancez-le une fois avec un environnement proche de celui de cron, qui ne reprend pas votre session interactive :
       env -i HOME="$HOME" python3 recherche_immobilier.py --a-blanc
@@ -68,6 +73,7 @@ Dépendances : pyyaml (déjà installé pour emails_scan.py)
 """
 
 import argparse
+import configparser
 import csv
 import datetime
 import email
@@ -80,6 +86,7 @@ import re
 import sys
 import unicodedata
 import urllib.parse
+import urllib.request
 from email.utils import parsedate_to_datetime
 from html.parser import HTMLParser
 from pathlib import Path
@@ -153,6 +160,10 @@ criteres:
     # budget_min: 0
     budget_max: 200000
     codes_postaux: ["61300"]
+
+telegram:
+  config_path: ~/.telegram_config   # même fichier/bot que emails_scan.py (section [telegram])
+  notifier_si_rien: false           # true : envoie aussi un message quand il n'y a rien de nouveau
 """
 
 # --------------------------------------------------------------------------
@@ -203,6 +214,28 @@ def hyperlink_formula(url: str) -> str:
     if not url:
         return ""
     return f'=LIEN.HYPERTEXTE("{url}";"Voir l\'annonce")'
+
+def load_telegram_config(path: Path):
+    """Même fichier/bot que emails_scan.py (section [telegram], clés
+    token_groq et chat_id) : aucun doublon de configuration ni de jeton."""
+    parser = configparser.ConfigParser()
+    parser.read(path)
+    if not parser.has_section("telegram"):
+        return None, None
+    return (parser.get("telegram", "token_groq", fallback=None),
+            parser.get("telegram", "chat_id", fallback=None))
+
+def send_telegram(token: str, chat_id: str, text: str) -> None:
+    """Échoue silencieusement (avertissement sur stderr) : une notification
+    manquée ne doit jamais empêcher le reste du script de s'exécuter."""
+    if not token or not chat_id:
+        return
+    url = f"https://api.telegram.org/bot{token}/sendMessage"
+    data = urllib.parse.urlencode({"chat_id": chat_id, "text": text}).encode()
+    try:
+        urllib.request.urlopen(urllib.request.Request(url, data=data), timeout=10)
+    except Exception as e:
+        print(f"⚠ Notification Telegram échouée : {e}", file=sys.stderr)
 
 # --------------------------------------------------------------------------
 # Lecture du contenu d'un e-mail
@@ -290,6 +323,12 @@ def message_tokens(msg) -> list[tuple[str, str]]:
 PRICE_RE = re.compile(
     r"^\s*(\d[\d .,]*)\s*€\s*(?:/?\s*mois|cc|hc|charges comprises|"
     r"charges non comprises)?\s*$", re.I)
+# Un prix au m² (ex. « 854,56 €/m² ») n'apparaît que sur une annonce à la
+# vente ; un prix suivi de « /mois » n'apparaît que sur une location. Ces deux
+# indices, présents juste à côté du prix, permettent de déduire la
+# transaction même quand l'e-mail ne contient ni « louer/vendre » ni bandeau
+# « Votre recherche » (cas des alertes « 1 nouvelle annonce... » à bien unique).
+PRICE_PER_M2_RE = re.compile(r"€\s*/\s*m[²2]", re.I)
 TYPE_RE = re.compile(
     r"^(appartement|maison|studio|loft|duplex|triplex|villa|terrain|parking|"
     r"immeuble|local|bureau|commerce|chateau|propriete|peniche)\b", re.I)
@@ -371,6 +410,8 @@ def extract_cards(tokens, include_similar: bool) -> list[dict]:
             cur = {"prix": parse_price(price.group(1)), "href": href,
                    "type": "", "transaction": "", "pieces": "", "surface": "",
                    "quartier": "", "ville": "", "cp": "", "similaire": in_similar}
+            if "mois" in n:
+                cur["transaction"] = "location"
             continue
         if cur is None:
             continue
@@ -380,6 +421,9 @@ def extract_cards(tokens, include_similar: bool) -> list[dict]:
             if href:
                 cur["href"] = href
             close()
+            continue
+        if not cur["transaction"] and PRICE_PER_M2_RE.search(text):
+            cur["transaction"] = "achat"
             continue
         type_m = TYPE_RE.match(norm(text))
         if type_m and not cur["type"]:
@@ -630,6 +674,23 @@ def write_html_page(known: dict[str, dict]) -> None:
     tmp.write_text(html_doc, encoding="utf-8")
     tmp.replace(HTML_FILE)
 
+def telegram_summary(rows: list[dict], n_new: int, n_price: int) -> str:
+    """Message compact : une ligne par nouveauté, puis le décompte des
+    changements de prix (sans repasser toutes les annonces en détail)."""
+    lines = [f"🏠 recherche_immobilier : {n_new} nouvelle(s), "
+             f"{n_price} changement(s) de prix"]
+    for r in [r for r in rows if r["statut"] == STATUS_NEW][:MAX_NEW_PRINTED]:
+        place = f"{r['quartier'] + ', ' if r['quartier'] else ''}{r['ville']}"
+        lines.append(f"+ {r['transaction']} {r['type']} — {r['prix_eur']} € — "
+                     f"{r['pieces'] or '?'} p. — {r['surface_m2'] or '?'} m² — {place}")
+        if r["lien"]:
+            lines.append(f"  {r['lien']}")
+    for r in [r for r in rows if r["statut"] == STATUS_PRICE]:
+        lines.append(f"~ {r['type']} {r['pieces'] or '?'} p. "
+                     f"{r['surface_m2'] or '?'} m² — {r['prix_precedent_eur']} € "
+                     f"-> {r['prix_eur']} €")
+    return "\n".join(lines)
+
 # --------------------------------------------------------------------------
 # Modes d'exécution
 # --------------------------------------------------------------------------
@@ -805,6 +866,12 @@ def main() -> int:
     state["traites"].extend(new_ids)
     save_state(state)
     print(f"[{now}] fichier(s) : {HISTORY_FILE.name}, {HTML_FILE.name}")
+
+    tg_cfg = cfg.get("telegram") or {}
+    if n_new or n_price or tg_cfg.get("notifier_si_rien"):
+        tg_token, tg_chat_id = load_telegram_config(
+            expand(tg_cfg.get("config_path", "~/.telegram_config")))
+        send_telegram(tg_token, tg_chat_id, telegram_summary(rows, n_new, n_price))
     return 0
 
 if __name__ == "__main__":
