@@ -28,3 +28,7 @@ history.json.lock
 Recherche_immo/*.log
 Scan_emails/*.log
 Timekeeping/*.log
+recherche_immobilier.yaml
+recherche_immobilier_etat.json
+recherche_immobilier_historique.csv
+*annonces.html
